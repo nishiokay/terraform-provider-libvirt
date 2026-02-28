@@ -40,7 +40,33 @@ func {{ .Name }}FromXML(ctx context.Context, xml *libvirtxml.{{ .Name }}, plan *
 	{{- $structName := .Name }}
 	{{- range .Fields }}
 	{{- if and (not .IsExcluded) (not .IsCycle) (not .IsFlattenedUnit) (not .IsFlattenedAttr) }}
-	{{- if and (eq $structName "DomainDeviceList") (eq .GoName "Disks") }}
+	{{- if and (eq $structName "DomainInterfaceSource") (eq .GoName "Network") }}
+	// Special case: OVS networks convert type='network' to type='bridge' internally.
+	// Preserve user's source.network intent even when libvirt returns source.bridge.
+	if plan == nil {
+		if xml.Network != nil {
+			nestedNetwork, err := DomainInterfaceSourceNetworkFromXML(ctx, xml.Network, nil)
+			if err != nil {
+				return nil, err
+			}
+			if nestedNetwork != nil {
+				objVal, diags := types.ObjectValueFrom(ctx, DomainInterfaceSourceNetworkAttributeTypes(), nestedNetwork)
+				if diags.HasError() {
+					return nil, fmt.Errorf("converting Network to Object: %s", diags.Errors()[0].Summary())
+				}
+				model.Network = objVal
+			} else {
+				model.Network = types.ObjectNull(DomainInterfaceSourceNetworkAttributeTypes())
+			}
+		} else {
+			model.Network = types.ObjectNull(DomainInterfaceSourceNetworkAttributeTypes())
+		}
+	} else if !plan.Network.IsNull() && !plan.Network.IsUnknown() {
+		model.Network = plan.Network
+	} else {
+		model.Network = types.ObjectNull(DomainInterfaceSourceNetworkAttributeTypes())
+	}
+	{{- else if and (eq $structName "DomainDeviceList") (eq .GoName "Disks") }}
 	// List of nested objects: Disks
 	planDisksKnown := plan != nil && !plan.Disks.IsNull() && !plan.Disks.IsUnknown()
 	if plan == nil || planDisksKnown {
