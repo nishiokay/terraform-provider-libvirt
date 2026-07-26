@@ -85,6 +85,17 @@ func (r *LibvirtXMLReflector) ReflectStruct(structType reflect.Type) (*generator
 			continue
 		}
 
+		if field.Anonymous {
+			if field.Type.Kind() == reflect.Struct {
+				embeddedIR, err := r.ReflectStruct(field.Type)
+				if err != nil {
+					return nil, fmt.Errorf("analyzing embedded struct %s: %w", field.Type.Name(), err)
+				}
+				ir.Fields = append(ir.Fields, embeddedIR.Fields...)
+			}
+			continue
+		}
+
 		fieldIR, err := r.analyzeField(typeName, field)
 		if err != nil {
 			return nil, fmt.Errorf("analyzing field %s: %w", field.Name, err)
@@ -94,9 +105,6 @@ func (r *LibvirtXMLReflector) ReflectStruct(structType reflect.Type) (*generator
 			ir.Fields = append(ir.Fields, fieldIR)
 		}
 	}
-
-	// Apply universal and resource-specific patterns
-	r.applyFieldPatterns(structType.Name(), ir.Fields)
 
 	// Post-process: expand chardata+attribute fields into separate flattened fields
 	// Example: <memory unit='KiB'>524288</memory> → memory (value), memory_unit (attr)
@@ -171,90 +179,7 @@ func (r *LibvirtXMLReflector) ReflectStruct(structType reflect.Type) (*generator
 	}
 	ir.Fields = expandedFields
 
-	// Apply patterns again after field expansion
-	r.applyFieldPatterns(structType.Name(), ir.Fields)
-
 	return ir, nil
-}
-
-// applyFieldPatterns applies universal and resource-specific field patterns
-func (r *LibvirtXMLReflector) applyFieldPatterns(structName string, fields []*generator.FieldIR) {
-	for _, field := range fields {
-		// Universal patterns (apply to ALL resources)
-		switch field.TFName {
-		case "uuid", "id", "key":
-			field.IsComputed = true
-			field.IsOptional = false
-			field.IsRequired = false
-			field.PlanModifier = "UseStateForUnknown"
-
-		case "name":
-			// At resource root level, name is required and immutable
-			if structName == "StoragePool" || structName == "Domain" || structName == "Network" || structName == "StorageVolume" {
-				field.IsRequired = true
-				field.IsOptional = false
-				field.PlanModifier = "RequiresReplace"
-			}
-
-		case "type":
-			// At resource root level, type is required and immutable
-			if structName == "StoragePool" || structName == "Domain" || structName == "Network" {
-				field.IsRequired = true
-				field.IsOptional = false
-				field.PlanModifier = "RequiresReplace"
-			}
-		}
-
-		// Resource-specific patterns
-		if structName == "StoragePool" {
-			// Skip unit fields - they stay optional
-			if field.IsFlattenedUnit {
-				continue
-			}
-
-			switch field.TFName {
-			case "capacity":
-				field.IsComputed = true
-				field.IsOptional = false
-				field.IsRequired = false
-				field.PlanModifier = "UseStateForUnknown"
-				// Pool capacity is purely reported by libvirt; always read from XML.
-				field.PreserveUserIntent = false
-
-			case "allocation", "available":
-				field.IsComputed = true
-				field.IsOptional = false
-				field.IsRequired = false
-				// Purely informational; always read from XML.
-				field.PreserveUserIntent = false
-			}
-		}
-
-		if structName == "StorageVolume" {
-			// Skip unit fields - they stay optional
-			if field.IsFlattenedUnit {
-				continue
-			}
-
-			switch field.TFName {
-			case "capacity":
-				field.IsComputed = true
-				field.IsOptional = false
-				field.IsRequired = false
-				// Keep PreserveUserIntent = true (set by analyzeField for pointer fields)
-				// so that when the user specifies capacity with a capacity_unit, the
-				// plan value is preserved on readback instead of the bytes-normalised
-				// value that libvirt returns (fixes issue #1253).
-
-			case "allocation", "physical":
-				field.IsComputed = true
-				field.IsOptional = false
-				field.IsRequired = false
-				// Purely informational; always read from XML.
-				field.PreserveUserIntent = false
-			}
-		}
-	}
 }
 
 func (r *LibvirtXMLReflector) analyzeField(structName string, field reflect.StructField) (*generator.FieldIR, error) {
@@ -263,15 +188,17 @@ func (r *LibvirtXMLReflector) analyzeField(structName string, field reflect.Stru
 		return nil, nil
 	}
 
-	// Skip embedded/anonymous fields
-	if field.Anonymous {
-		return nil, nil
-	}
-
 	xmlTag := field.Tag.Get("xml")
 	if xmlTag == "" {
-		// Skip fields without XML tags
-		return nil, nil
+		var err error
+		xmlTag, err = xmlTagFromChildXMLName(field.Type)
+		if err != nil {
+			return nil, err
+		}
+		if xmlTag == "" {
+			// Skip fields without XML tags
+			return nil, nil
+		}
 	}
 
 	isDashTag := xmlTag == "-"
@@ -282,7 +209,7 @@ func (r *LibvirtXMLReflector) analyzeField(structName string, field reflect.Stru
 
 	// Parse XML tag
 	parts := strings.Split(xmlTag, ",")
-	fieldIR.XMLName = parts[0]
+	fieldIR.XMLName = xmlElementName(parts[0])
 	if isDashTag {
 		fieldIR.XMLName = field.Name
 	}
@@ -421,6 +348,41 @@ func (r *LibvirtXMLReflector) analyzeField(structName string, field reflect.Stru
 	}
 
 	return fieldIR, nil
+}
+
+func xmlTagFromChildXMLName(fieldType reflect.Type) (string, error) {
+	if fieldType.Kind() == reflect.Ptr {
+		fieldType = fieldType.Elem()
+	}
+
+	if fieldType.Kind() != reflect.Struct {
+		return "", nil
+	}
+
+	xmlNameField, ok := fieldType.FieldByName("XMLName")
+	if !ok {
+		return "", nil
+	}
+
+	xmlTag := xmlNameField.Tag.Get("xml")
+	if xmlTag == "" || xmlTag == "-" {
+		return "", nil
+	}
+
+	return xmlTag, nil
+}
+
+func xmlElementName(xmlName string) string {
+	xmlName = strings.TrimSpace(xmlName)
+	if xmlName == "" {
+		return xmlName
+	}
+
+	if idx := strings.LastIndex(xmlName, " "); idx != -1 {
+		return xmlName[idx+1:]
+	}
+
+	return xmlName
 }
 
 func (r *LibvirtXMLReflector) goTypeToTFType(t reflect.Type) string {

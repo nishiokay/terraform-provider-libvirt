@@ -9,6 +9,57 @@ import (
 	"libvirt.org/go/libvirtxml"
 )
 
+func TestDomainHypervisorNamespaceRoundtrip(t *testing.T) {
+	ctx := context.Background()
+
+	original := &libvirtxml.Domain{
+		Type: "kvm",
+		Name: "test-hypervisor-namespaces",
+		QEMUCommandline: &libvirtxml.DomainQEMUCommandline{
+			Args: []libvirtxml.DomainQEMUCommandlineArg{
+				{Value: "-cpu"},
+				{Value: "host"},
+			},
+			Envs: []libvirtxml.DomainQEMUCommandlineEnv{
+				{Name: "QEMU_AUDIO_DRV", Value: "none"},
+			},
+		},
+		VMWareDataCenterPath: &libvirtxml.DomainVMWareDataCenterPath{
+			Value: "/Lab/DC1",
+		},
+	}
+
+	model, err := DomainFromXML(ctx, original, nil)
+	if err != nil {
+		t.Fatalf("DomainFromXML failed: %v", err)
+	}
+
+	if model.QEMUCommandline.IsNull() {
+		t.Fatal("QEMUCommandline should not be null")
+	}
+	if model.VMWareDataCenterPath.IsNull() || model.VMWareDataCenterPath.ValueString() != "/Lab/DC1" {
+		t.Fatalf("expected VMWareDataCenterPath=/Lab/DC1, got %v", model.VMWareDataCenterPath)
+	}
+
+	converted, err := DomainToXML(ctx, model)
+	if err != nil {
+		t.Fatalf("DomainToXML failed: %v", err)
+	}
+
+	if converted.QEMUCommandline == nil {
+		t.Fatal("QEMUCommandline should not be nil after roundtrip")
+	}
+	if len(converted.QEMUCommandline.Args) != 2 {
+		t.Fatalf("expected 2 QEMU args, got %d", len(converted.QEMUCommandline.Args))
+	}
+	if converted.QEMUCommandline.Args[0].Value != "-cpu" || converted.QEMUCommandline.Args[1].Value != "host" {
+		t.Fatalf("unexpected QEMU args after roundtrip: %+v", converted.QEMUCommandline.Args)
+	}
+	if converted.VMWareDataCenterPath == nil || converted.VMWareDataCenterPath.Value != "/Lab/DC1" {
+		t.Fatalf("unexpected VMWareDataCenterPath after roundtrip: %+v", converted.VMWareDataCenterPath)
+	}
+}
+
 // TestDomainTimerCatchUpRoundtrip tests conversion of a simple struct with no nesting
 func TestDomainTimerCatchUpRoundtrip(t *testing.T) {
 	ctx := context.Background()
@@ -205,6 +256,48 @@ func TestDomainCPUModePreservesPlanValue(t *testing.T) {
 
 	if got := model.Mode.ValueString(); got != "host-model" {
 		t.Fatalf("expected mode host-model from plan, got %q", got)
+	}
+}
+
+func TestDomainGraphicSpiceListenPreservesPlanValueWhenXMLListenIsOmitted(t *testing.T) {
+	ctx := context.Background()
+
+	plan := &DomainGraphicSpiceModel{
+		Port:          types.Int64Null(),
+		TLSPort:       types.Int64Null(),
+		AutoPort:      types.BoolNull(),
+		Listen:        types.StringValue("0.0.0.0"),
+		Keymap:        types.StringNull(),
+		DefaultMode:   types.StringNull(),
+		Passwd:        types.StringNull(),
+		PasswdValidTo: types.StringNull(),
+		Connected:     types.StringNull(),
+		Listeners:     types.ListNull(types.ObjectType{AttrTypes: DomainGraphicListenerAttributeTypes()}),
+		Channel:       types.ListNull(types.ObjectType{AttrTypes: DomainGraphicSpiceChannelAttributeTypes()}),
+		Image:         types.ObjectNull(DomainGraphicSpiceImageAttributeTypes()),
+		JPEG:          types.ObjectNull(DomainGraphicSpiceJPEGAttributeTypes()),
+		ZLib:          types.ObjectNull(DomainGraphicSpiceZLibAttributeTypes()),
+		Playback:      types.ObjectNull(DomainGraphicSpicePlaybackAttributeTypes()),
+		Streaming:     types.ObjectNull(DomainGraphicSpiceStreamingAttributeTypes()),
+		Mouse:         types.ObjectNull(DomainGraphicSpiceMouseAttributeTypes()),
+		ClipBoard:     types.ObjectNull(DomainGraphicSpiceClipBoardAttributeTypes()),
+		FileTransfer:  types.ObjectNull(DomainGraphicSpiceFileTransferAttributeTypes()),
+		GL:            types.ObjectNull(DomainGraphicSpiceGLAttributeTypes()),
+	}
+
+	xmlSpice := &libvirtxml.DomainGraphicSpice{}
+
+	model, err := DomainGraphicSpiceFromXML(ctx, xmlSpice, plan)
+	if err != nil {
+		t.Fatalf("DomainGraphicSpiceFromXML failed: %v", err)
+	}
+
+	if model.Listen.IsNull() {
+		t.Fatal("Listen should not be null")
+	}
+
+	if got := model.Listen.ValueString(); got != "0.0.0.0" {
+		t.Fatalf("expected listen 0.0.0.0 from plan, got %q", got)
 	}
 }
 
@@ -815,5 +908,145 @@ func TestDomainDeviceListFromXMLPreservesDiskOrderByTargetDev(t *testing.T) {
 	}
 	if secondVolume.Pool.ValueString() != "ssd" || secondVolume.Volume.ValueString() != "vm-01-cloudinit.iso" {
 		t.Fatalf("unexpected second disk volume: %s/%s", secondVolume.Pool.ValueString(), secondVolume.Volume.ValueString())
+	}
+}
+
+func TestDomainSerialFromXMLPreservesPlannedAliasWhenXMLAliasIsOmitted(t *testing.T) {
+	ctx := context.Background()
+
+	alias := DomainAliasModel{
+		Name: types.StringValue("serial0"),
+	}
+	aliasObject, diags := types.ObjectValueFrom(ctx, DomainAliasAttributeTypes(), alias)
+	if diags.HasError() {
+		t.Fatalf("alias ObjectValueFrom failed: %s", diags.Errors()[0].Summary())
+	}
+
+	plan := &DomainSerialModel{
+		Source:   types.ObjectNull(DomainChardevSourceAttributeTypes()),
+		Protocol: types.ObjectNull(DomainChardevProtocolAttributeTypes()),
+		Target:   types.ObjectNull(DomainSerialTargetAttributeTypes()),
+		Log:      types.ObjectNull(DomainChardevLogAttributeTypes()),
+		ACPI:     types.ObjectNull(DomainDeviceACPIAttributeTypes()),
+		Alias:    aliasObject,
+		Address:  types.ObjectNull(DomainAddressAttributeTypes()),
+	}
+
+	model, err := DomainSerialFromXML(ctx, &libvirtxml.DomainSerial{}, plan)
+	if err != nil {
+		t.Fatalf("DomainSerialFromXML failed: %v", err)
+	}
+	if model.Alias.IsNull() {
+		t.Fatal("Alias should be preserved when planned and omitted from XML")
+	}
+
+	var got DomainAliasModel
+	if diags := model.Alias.As(ctx, &got, basetypes.ObjectAsOptions{}); diags.HasError() {
+		t.Fatalf("alias As failed: %s", diags.Errors()[0].Summary())
+	}
+	if got.Name.IsNull() || got.Name.ValueString() != "serial0" {
+		t.Fatalf("expected alias name serial0, got %v", got.Name)
+	}
+}
+
+func TestDomainConsoleFromXMLPreservesPlannedAliasWhenXMLAliasIsOmitted(t *testing.T) {
+	ctx := context.Background()
+
+	alias := DomainAliasModel{
+		Name: types.StringValue("serial0"),
+	}
+	aliasObject, diags := types.ObjectValueFrom(ctx, DomainAliasAttributeTypes(), alias)
+	if diags.HasError() {
+		t.Fatalf("alias ObjectValueFrom failed: %s", diags.Errors()[0].Summary())
+	}
+
+	plan := &DomainConsoleModel{
+		TTY:      types.StringNull(),
+		Source:   types.ObjectNull(DomainChardevSourceAttributeTypes()),
+		Protocol: types.ObjectNull(DomainChardevProtocolAttributeTypes()),
+		Target:   types.ObjectNull(DomainConsoleTargetAttributeTypes()),
+		Log:      types.ObjectNull(DomainChardevLogAttributeTypes()),
+		ACPI:     types.ObjectNull(DomainDeviceACPIAttributeTypes()),
+		Alias:    aliasObject,
+		Address:  types.ObjectNull(DomainAddressAttributeTypes()),
+	}
+
+	model, err := DomainConsoleFromXML(ctx, &libvirtxml.DomainConsole{}, plan)
+	if err != nil {
+		t.Fatalf("DomainConsoleFromXML failed: %v", err)
+	}
+	if model.Alias.IsNull() {
+		t.Fatal("Alias should be preserved when planned and omitted from XML")
+	}
+
+	var got DomainAliasModel
+	if diags := model.Alias.As(ctx, &got, basetypes.ObjectAsOptions{}); diags.HasError() {
+		t.Fatalf("alias As failed: %s", diags.Errors()[0].Summary())
+	}
+	if got.Name.IsNull() || got.Name.ValueString() != "serial0" {
+		t.Fatalf("expected alias name serial0, got %v", got.Name)
+	}
+}
+
+func TestStorageVolumeToXMLAllocationSemantics(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name       string
+		allocation types.Int64
+		wantNil    bool
+		wantValue  uint64
+	}{
+		{
+			name:       "null is omitted",
+			allocation: types.Int64Null(),
+			wantNil:    true,
+		},
+		{
+			name:       "unknown is omitted",
+			allocation: types.Int64Unknown(),
+			wantNil:    true,
+		},
+		{
+			name:       "explicit zero requests sparse allocation",
+			allocation: types.Int64Value(0),
+			wantValue:  0,
+		},
+		{
+			name:       "explicit capacity requests full allocation",
+			allocation: types.Int64Value(1024 * 1024),
+			wantValue:  1024 * 1024,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := &StorageVolumeModel{
+				Name:           types.StringValue("test-volume"),
+				Allocation:     tt.allocation,
+				AllocationUnit: types.StringNull(),
+				Capacity:       types.Int64Value(1024 * 1024),
+				CapacityUnit:   types.StringNull(),
+			}
+
+			xml, err := StorageVolumeToXML(ctx, model)
+			if err != nil {
+				t.Fatalf("StorageVolumeToXML failed: %v", err)
+			}
+
+			if tt.wantNil {
+				if xml.Allocation != nil {
+					t.Fatalf("expected allocation to be omitted, got %+v", xml.Allocation)
+				}
+				return
+			}
+
+			if xml.Allocation == nil {
+				t.Fatal("expected allocation to be present")
+			}
+			if xml.Allocation.Value != tt.wantValue {
+				t.Fatalf("expected allocation %d, got %d", tt.wantValue, xml.Allocation.Value)
+			}
+		})
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -109,6 +110,11 @@ func (r *VolumeResource) Schema(ctx context.Context, req resource.SchemaRequest,
 			Optional:    true,
 			Computed:    true,
 		},
+		"allocation": schema.Int64Attribute{
+			Description: "Initial volume allocation in bytes. Omit to use libvirt's default full allocation; set below capacity to request sparse allocation where supported.",
+			Optional:    true,
+			Computed:    true,
+		},
 		"target": schema.SingleNestedAttribute{
 			Optional:   true,
 			Attributes: targetAttrs,
@@ -127,6 +133,9 @@ func (r *VolumeResource) Schema(ctx context.Context, req resource.SchemaRequest,
 						},
 					},
 				},
+			},
+			PlanModifiers: []planmodifier.Object{
+				objectplanmodifier.RequiresReplace(),
 			},
 		},
 	})
@@ -178,7 +187,7 @@ func (r *VolumeResource) Create(ctx context.Context, req resource.CreateRequest,
 
 	// Check if we're uploading content from a URL
 	var uploadStream *URLStream
-	var uploadCapacity int64
+	var uploadCapacity *int64
 
 	if !model.Create.IsNull() && !model.Create.IsUnknown() {
 		var createModel VolumeCreateModel
@@ -213,25 +222,40 @@ func (r *VolumeResource) Create(ctx context.Context, req resource.CreateRequest,
 			uploadStream = stream
 			uploadCapacity = stream.Size
 
-			tflog.Info(ctx, "URL stream opened", map[string]any{
-				"url":  uploadURL,
-				"size": uploadCapacity,
-			})
+			logFields := map[string]any{"url": uploadURL}
+			if uploadCapacity != nil {
+				logFields["size"] = *uploadCapacity
+			}
+			tflog.Info(ctx, "URL stream opened", logFields)
 		}
 	}
 
-	// Determine capacity: from upload stream or from user-provided value
+	// Determine volume capacity independently from upload length. A configured
+	// capacity may intentionally be larger than the source image.
 	var volumeCapacity int64
-	if uploadStream != nil {
-		volumeCapacity = uploadCapacity
-	} else if model.Capacity.IsNull() || model.Capacity.IsUnknown() {
+	if !model.Capacity.IsNull() && !model.Capacity.IsUnknown() {
+		volumeCapacity = model.Capacity.ValueInt64()
+		if uploadCapacity != nil && volumeCapacity < *uploadCapacity {
+			resp.Diagnostics.AddError(
+				"Insufficient Capacity",
+				fmt.Sprintf("Configured volume capacity %d is smaller than upload content length %d", volumeCapacity, *uploadCapacity),
+			)
+			return
+		}
+	} else if uploadCapacity != nil {
+		volumeCapacity = *uploadCapacity
+	} else if uploadStream != nil {
+		resp.Diagnostics.AddError(
+			"Missing Capacity",
+			"Volume capacity is required when the upload source does not provide Content-Length",
+		)
+		return
+	} else {
 		resp.Diagnostics.AddError(
 			"Missing Capacity",
 			"Volume capacity is required when not uploading from a URL",
 		)
 		return
-	} else {
-		volumeCapacity = model.Capacity.ValueInt64()
 	}
 
 	// Create a model for XML conversion with computed capacity
@@ -289,13 +313,18 @@ func (r *VolumeResource) Create(ctx context.Context, req resource.CreateRequest,
 			}
 		}()
 
+		uploadLength := volumeCapacity
+		if uploadCapacity != nil {
+			uploadLength = *uploadCapacity
+		}
+
 		tflog.Info(ctx, "Uploading content to volume", map[string]any{
-			"size": uploadCapacity,
+			"size": uploadLength,
 		})
 
 		// Upload the content using StorageVolUpload
-		// The 0 flag means start at offset 0, uploadCapacity is the length
-		err = r.client.Libvirt().StorageVolUpload(volume, uploadStream.Reader, 0, uint64(uploadCapacity), 0)
+		// The 0 flag means start at offset 0; length is the source byte count.
+		err = r.client.Libvirt().StorageVolUpload(volume, uploadStream.Reader, 0, uint64(uploadLength), 0)
 		if err != nil {
 			// Upload failed, try to clean up the volume (ignore cleanup errors to preserve original error)
 			if delErr := r.client.Libvirt().StorageVolDelete(volume, 0); delErr != nil {
@@ -335,6 +364,14 @@ func (r *VolumeResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
+	// After import only identity fields are populated. In that sparse state,
+	// read all XML-backed fields instead of preserving absent prior config.
+	isImport := model.Name.IsNull() || model.Name.IsUnknown()
+	var plan *generated.StorageVolumeModel
+	if !isImport {
+		plan = &model.StorageVolumeModel
+	}
+
 	// Look up the volume by key
 	volume, err := r.client.Libvirt().StorageVolLookupByKey(model.Key.ValueString())
 	if err != nil {
@@ -347,7 +384,7 @@ func (r *VolumeResource) Read(ctx context.Context, req resource.ReadRequest, res
 	}
 
 	// Read the volume state (use current state as plan to preserve user intent)
-	resp.Diagnostics.Append(r.readVolume(ctx, &model, volume, &model.StorageVolumeModel)...)
+	resp.Diagnostics.Append(r.readVolume(ctx, &model, volume, plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -397,6 +434,9 @@ func (r *VolumeResource) readVolume(ctx context.Context, model *VolumeResourceMo
 
 	// Update the embedded model
 	model.StorageVolumeModel = *volumeModel
+	model.ID = types.StringValue(volume.Key)
+	model.Key = types.StringValue(volume.Key)
+	model.Pool = types.StringValue(volume.Pool)
 
 	// Populate computed fields that generated conversion might skip
 	// target.path is Computed, always populate it
@@ -476,4 +516,5 @@ func (r *VolumeResource) Delete(ctx context.Context, req resource.DeleteRequest,
 // ImportState imports an existing storage volume
 func (r *VolumeResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+	resource.ImportStatePassthroughID(ctx, path.Root("key"), req, resp)
 }

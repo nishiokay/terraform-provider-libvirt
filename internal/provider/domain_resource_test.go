@@ -3,8 +3,10 @@ package provider
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 	libvirtclient "github.com/dmacvicar/terraform-provider-libvirt/v2/internal/libvirt"
@@ -170,6 +172,31 @@ resource "libvirt_domain" "test" {
 `, name)
 }
 
+func testAccDomainResourceConfigBasicUpdatedWithUpdateShutdown(name string, timeout int64) string {
+	return fmt.Sprintf(`
+
+resource "libvirt_domain" "test" {
+  name   = %[1]q
+  memory = 1024
+  memory_unit   = "MiB"
+  vcpu   = 2
+  type   = "kvm"
+
+  update = {
+    shutdown = {
+      timeout = %[2]d
+    }
+  }
+
+  os = {
+    type    = "hvm"
+    type_arch    = "x86_64"
+    type_machine = "q35"
+  }
+}
+`, name, timeout)
+}
+
 func testAccDomainResourceConfigUEFI(name string) string {
 	return fmt.Sprintf(`
 
@@ -301,6 +328,27 @@ func TestAccDomainResource_cpu(t *testing.T) {
 	})
 }
 
+func TestAccDomainResource_cpuHostModelPreservesPlanValue(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckDomainDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDomainResourceConfigCPUHostModel("test-domain-cpu-host-model"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_domain.test", "name", "test-domain-cpu-host-model"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "cpu.mode", "host-model"),
+				),
+			},
+			{
+				Config:   testAccDomainResourceConfigCPUHostModel("test-domain-cpu-host-model"),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 func testAccDomainResourceConfigCPU(name string) string {
 	return fmt.Sprintf(`
 
@@ -319,6 +367,29 @@ resource "libvirt_domain" "test" {
 
   cpu = {
     mode = "host-passthrough"
+  }
+}
+`, name)
+}
+
+func testAccDomainResourceConfigCPUHostModel(name string) string {
+	return fmt.Sprintf(`
+
+resource "libvirt_domain" "test" {
+  name   = %[1]q
+  memory = 512
+  memory_unit   = "MiB"
+  vcpu   = 2
+  type   = "kvm"
+
+  os = {
+    type    = "hvm"
+    type_arch    = "x86_64"
+    type_machine = "q35"
+  }
+
+  cpu = {
+    mode = "host-model"
   }
 }
 `, name)
@@ -424,6 +495,96 @@ func TestAccDomainResource_running(t *testing.T) {
 	})
 }
 
+func TestAccDomainResource_runningRestartsStoppedDomain(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckDomainDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config:             testAccDomainResourceConfigRunning("test-domain-running-restart"),
+				ExpectNonEmptyPlan: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_domain.test", "running", "true"),
+					testAccCheckDomainIsRunning("test-domain-running-restart"),
+					testAccCheckDomainStop("test-domain-running-restart"),
+				),
+			},
+			{
+				Config: testAccDomainResourceConfigRunning("test-domain-running-restart"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_domain.test", "running", "true"),
+					testAccCheckDomainIsRunning("test-domain-running-restart"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccDomainResource_destroyShutdownStoppedDomain(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckDomainDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDomainResourceConfigDestroyShutdownStopped("test-domain-destroy-shutdown-stopped", 1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_domain.test", "name", "test-domain-destroy-shutdown-stopped"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccDomainResource_destroyShutdownStoppedDomainDefaultTimeout(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckDomainDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDomainResourceConfigDestroyShutdownStoppedDefaultTimeout("test-domain-destroy-shutdown-stopped-default"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_domain.test", "name", "test-domain-destroy-shutdown-stopped-default"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccDomainResource_destroyShutdownRunningWithImage(t *testing.T) {
+	imagePath := os.Getenv("LIBVIRT_TEST_ACPI_IMAGE")
+	if imagePath == "" {
+		t.Skip("set LIBVIRT_TEST_ACPI_IMAGE to run shutdown test with a real guest image")
+	}
+	if _, err := os.Stat(imagePath); err != nil {
+		t.Skipf("LIBVIRT_TEST_ACPI_IMAGE does not exist: %v", err)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckDomainDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDomainResourceConfigDestroyShutdownRunningWithImage("test-domain-shutdown-image", "test-volume-shutdown-image", "test-pool-shutdown-image", "/var/lib/libvirt/images/test-pool-shutdown-image", imagePath, 120),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_domain.test", "name", "test-domain-shutdown-image"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "running", "true"),
+					testAccCheckDomainIsRunning("test-domain-shutdown-image"),
+				),
+			},
+			{
+				// Give the guest time to finish early boot before testing shutdown behavior.
+				PreConfig: func() { time.Sleep(45 * time.Second) },
+				Config:    testAccDomainResourceConfigDestroyShutdownRunningWithImage("test-domain-shutdown-image", "test-volume-shutdown-image", "test-pool-shutdown-image", "/var/lib/libvirt/images/test-pool-shutdown-image", imagePath, 120),
+				Destroy:   true,
+			},
+		},
+	})
+}
+
 func TestAccDomainResource_updateWithRunning(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -442,15 +603,63 @@ func TestAccDomainResource_updateWithRunning(t *testing.T) {
 			},
 			// Update while running
 			{
-				Config: testAccDomainResourceConfigBasicUpdated("test-domain-update"),
+				Config: testAccDomainResourceConfigBasicUpdatedWithUpdateShutdown("test-domain-update", 60),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("libvirt_domain.test", "name", "test-domain-update"),
 					resource.TestCheckResourceAttr("libvirt_domain.test", "memory", "1024"),
 					resource.TestCheckResourceAttr("libvirt_domain.test", "vcpu", "2"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "update.shutdown.timeout", "60"),
 				),
 			},
 		},
 	})
+}
+
+// TestAccDomainResource_updateRunningDomainIDConsistency verifies that updating
+// a running domain does not cause a "Provider produced inconsistent result after
+// apply" error on the id attribute when the domain restarts with a new runtime id.
+func TestAccDomainResource_updateRunningDomainIDConsistency(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckDomainDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDomainResourceConfigRunning("test-domain-id-consistency"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_domain.test", "running", "true"),
+					resource.TestCheckResourceAttrSet("libvirt_domain.test", "id"),
+				),
+			},
+			{
+				Config: testAccDomainResourceConfigRunningUpdated("test-domain-id-consistency"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_domain.test", "memory", "1024"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "running", "true"),
+					resource.TestCheckResourceAttrSet("libvirt_domain.test", "id"),
+				),
+			},
+		},
+	})
+}
+
+func testAccDomainResourceConfigRunningUpdated(name string) string {
+	return fmt.Sprintf(`
+resource "libvirt_domain" "test" {
+  name        = %[1]q
+  memory      = 1024
+  memory_unit = "MiB"
+  vcpu        = 1
+  type        = "kvm"
+  running     = true
+
+  os = {
+    type         = "hvm"
+    type_arch    = "x86_64"
+    type_machine = "q35"
+  }
+}
+`, name)
 }
 
 func TestAccDomainResource_updateKeepsNvram(t *testing.T) {
@@ -618,6 +827,141 @@ resource "libvirt_domain" "test" {
 `, name)
 }
 
+func testAccDomainResourceConfigDestroyShutdownStopped(name string, timeout int64) string {
+	return fmt.Sprintf(`
+
+resource "libvirt_domain" "test" {
+  name    = %[1]q
+  memory  = 512
+  memory_unit    = "MiB"
+  vcpu    = 1
+  type    = "kvm"
+
+  destroy = {
+    shutdown = {
+      timeout = %[2]d
+    }
+  }
+
+  os = {
+    type    = "hvm"
+    type_arch    = "x86_64"
+    type_machine = "q35"
+  }
+}
+`, name, timeout)
+}
+
+func testAccDomainResourceConfigDestroyShutdownStoppedDefaultTimeout(name string) string {
+	return fmt.Sprintf(`
+
+resource "libvirt_domain" "test" {
+  name    = %[1]q
+  memory  = 512
+  memory_unit    = "MiB"
+  vcpu    = 1
+  type    = "kvm"
+
+  destroy = {
+    shutdown = {}
+  }
+
+  os = {
+    type    = "hvm"
+    type_arch    = "x86_64"
+    type_machine = "q35"
+  }
+}
+`, name)
+}
+
+func testAccDomainResourceConfigDestroyShutdownRunningWithImage(domainName, volumeName, poolName, poolPath, imagePath string, timeout int64) string {
+	return fmt.Sprintf(`
+resource "libvirt_pool" "test" {
+  name = %[3]q
+  type = "dir"
+  target = {
+    path = %[4]q
+    permissions = {
+      mode = "777"
+    }
+  }
+}
+
+resource "libvirt_volume" "test" {
+  name = "%[2]s.qcow2"
+  pool = libvirt_pool.test.name
+  target = {
+    permissions = {
+      mode = "666"
+    }
+    format = {
+      type = "qcow2"
+    }
+  }
+  create = {
+    content = {
+      url = %[5]q
+    }
+  }
+}
+
+resource "libvirt_domain" "test" {
+  name    = %[1]q
+  memory  = 512
+  memory_unit = "MiB"
+  vcpu    = 1
+  type    = "kvm"
+  running = true
+
+  destroy = {
+    shutdown = {
+      timeout = %[6]d
+    }
+  }
+
+  os = {
+    type         = "hvm"
+    type_arch    = "x86_64"
+    type_machine = "q35"
+  }
+
+  features = {
+    acpi = true
+  }
+
+  devices = {
+    disks = [
+      {
+        source = {
+          volume = {
+            pool   = libvirt_pool.test.name
+            volume = libvirt_volume.test.name
+          }
+        }
+        driver = {
+          name = "qemu"
+          type = "qcow2"
+        }
+        target = {
+          dev = "sda"
+          bus = "sata"
+        }
+      }
+    ]
+    graphics = [
+      {
+        vnc = {
+          auto_port = true
+          listen    = "0.0.0.0"
+        }
+      }
+    ]
+  }
+}
+`, domainName, volumeName, poolName, poolPath, imagePath, timeout)
+}
+
 func testAccCheckDomainIsRunning(name string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		ctx := context.Background()
@@ -695,6 +1039,49 @@ func testAccCheckDomainStart(name string) resource.TestCheckFunc {
 
 		if uint32(state) != uint32(golibvirt.DomainRunning) {
 			return fmt.Errorf("domain is not running, state = %d", state)
+		}
+
+		return nil
+	}
+}
+
+func testAccCheckDomainStop(name string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		ctx := context.Background()
+		client, err := libvirtclient.NewClient(ctx, testAccLibvirtURI())
+		if err != nil {
+			return fmt.Errorf("failed to create libvirt client: %w", err)
+		}
+		defer func() { _ = client.Close() }()
+
+		domains, _, err := client.Libvirt().ConnectListAllDomains(1, 0)
+		if err != nil {
+			return fmt.Errorf("failed to list domains: %w", err)
+		}
+
+		var targetDomain *golibvirt.Domain
+		for _, d := range domains {
+			if d.Name == name {
+				targetDomain = &d
+				break
+			}
+		}
+
+		if targetDomain == nil {
+			return fmt.Errorf("domain %s not found", name)
+		}
+
+		state, _, err := client.Libvirt().DomainGetState(*targetDomain, 0)
+		if err != nil {
+			return fmt.Errorf("failed to get domain state: %w", err)
+		}
+
+		if uint32(state) != uint32(golibvirt.DomainRunning) {
+			return fmt.Errorf("domain is not running before stop, state = %d", state)
+		}
+
+		if err := client.Libvirt().DomainDestroy(*targetDomain); err != nil {
+			return fmt.Errorf("failed to stop domain %s: %w", name, err)
 		}
 
 		return nil
@@ -1350,6 +1737,46 @@ func TestAccDomainResource_console(t *testing.T) {
 	})
 }
 
+func TestAccDomainResource_consoleAndSerialAlias(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckDomainDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDomainResourceConfigConsoleAndSerialAlias("test-domain-console-serial-alias"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_domain.test", "name", "test-domain-console-serial-alias"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "running", "false"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.#", "1"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.0.alias.name", "serial0"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.0.protocol.type", "telnet"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.0.source.tcp.host", "127.0.0.1"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.0.source.tcp.mode", "bind"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.0.source.tcp.service", "12345"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.0.source.tcp.tls", "no"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.0.target.type", "isa-serial"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.0.target.port", "0"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.serials.0.target.model.name", "isa-serial"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.consoles.#", "1"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.consoles.0.alias.name", "serial0"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.consoles.0.protocol.type", "telnet"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.consoles.0.source.tcp.host", "127.0.0.1"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.consoles.0.source.tcp.mode", "bind"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.consoles.0.source.tcp.service", "12345"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.consoles.0.source.tcp.tls", "no"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.consoles.0.target.type", "serial"),
+					resource.TestCheckResourceAttr("libvirt_domain.test", "devices.consoles.0.target.port", "0"),
+				),
+			},
+			{
+				Config:   testAccDomainResourceConfigConsoleAndSerialAlias("test-domain-console-serial-alias"),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 func testAccDomainResourceConfigConsole(name string) string {
 	return fmt.Sprintf(`
 resource "libvirt_domain" "test" {
@@ -1375,6 +1802,76 @@ resource "libvirt_domain" "test" {
         }
         target = {
           type = "serial"
+        }
+      }
+    ]
+  }
+}
+`, name)
+}
+
+func testAccDomainResourceConfigConsoleAndSerialAlias(name string) string {
+	return fmt.Sprintf(`
+resource "libvirt_domain" "test" {
+  name        = %[1]q
+  running     = false
+  memory      = 512
+  memory_unit = "MiB"
+  vcpu        = 1
+  type        = "kvm"
+
+  os = {
+    type         = "hvm"
+    type_arch    = "x86_64"
+    type_machine = "q35"
+  }
+
+  devices = {
+    serials = [
+      {
+        alias = {
+          name = "serial0"
+        }
+        source = {
+          tcp = {
+            mode    = "bind"
+            host    = "127.0.0.1"
+            service = "12345"
+            tls     = "no"
+          }
+        }
+        protocol = {
+          type = "telnet"
+        }
+        target = {
+          type = "isa-serial"
+          port = 0
+          model = {
+            name = "isa-serial"
+          }
+        }
+      }
+    ]
+
+    consoles = [
+      {
+        alias = {
+          name = "serial0"
+        }
+        source = {
+          tcp = {
+            mode    = "bind"
+            host    = "127.0.0.1"
+            service = "12345"
+            tls     = "no"
+          }
+        }
+        protocol = {
+          type = "telnet"
+        }
+        target = {
+          type = "serial"
+          port = 0
         }
       }
     ]

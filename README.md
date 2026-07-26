@@ -103,6 +103,34 @@ For non-released versions, see [XML <-> HCL mapping](docs/schema-mapping.md) and
 
 All resources use a single XML <-> HCL mapping spec (flattening rules, unions, presence booleans, nested attributes). See [XML <-> HCL mapping](docs/schema-mapping.md) documentation for the canonical rules.
 
+### Lifecycle Operation Controls
+
+Some resources expose provider-specific lifecycle operation controls using nested `create`/`destroy` objects.
+These fields control post-define and pre-undefine API operations (for example build/start/delete behavior), and are not direct libvirt XML fields.
+Current lifecycle controls are experimental and may change in future releases.
+
+Example (`libvirt_pool`):
+
+```hcl
+resource "libvirt_pool" "data" {
+  name = "data-pool"
+  type = "dir"
+  target = {
+    path = "/var/lib/libvirt/data"
+  }
+
+  create = {
+    build     = true
+    start     = true
+    autostart = true
+  }
+
+  destroy = {
+    delete = false
+  }
+}
+```
+
 ### Development
 
 This is the first project where I leveraged AI quite heavily not only to do a major cleanup and rewrite of pieces of code, and to implement a new design, but we also use it to inject documentation into the schema.
@@ -248,15 +276,15 @@ resource "libvirt_volume" "ubuntu" {
       url = "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
     }
   }
-  # capacity is automatically detected from Content-Length header
+  # capacity is automatically detected from Content-Length when available
 }
 ```
 
 **Important notes:**
 1. **Format is required**: You must explicitly specify the `format` attribute (e.g., `"qcow2"`, `"raw"`). The legacy provider auto-detected format from file extension, but the new provider requires it.
-2. **Capacity is computed**: Like the legacy provider, `capacity` is automatically computed from the HTTP `Content-Length` header (or file size for local files). You don't need to specify it.
+2. **Capacity is computed when possible**: The provider uses the HTTP `Content-Length` header when available, or the file size for local files.
 3. **Local files supported**: You can use absolute paths or `file://` URIs for local files: `url = "/path/to/local.qcow2"` or `url = "file:///path/to/local.qcow2"`
-4. **Content-Length required**: For HTTPS URLs, the server must provide a `Content-Length` header. If it doesn't, volume creation will fail.
+4. **Set `capacity` when `Content-Length` is missing**: For HTTP(S) URLs that do not provide `Content-Length`, specify `capacity` explicitly.
 
 
 ## Contributing
@@ -277,7 +305,7 @@ If you contribute code or issues and used AI, you are required to disclose it, i
 
 ## Author
 
-* Duncan Mac-Vicar P.
+* Duncan Mac-Vicar P. (upstream)
 
 ## License
 

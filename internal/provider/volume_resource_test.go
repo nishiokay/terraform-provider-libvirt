@@ -1,14 +1,20 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	libvirtclient "github.com/dmacvicar/terraform-provider-libvirt/v2/internal/libvirt"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
 func init() {
@@ -71,7 +77,98 @@ func TestAccVolumeResource_basic(t *testing.T) {
 					resource.TestCheckResourceAttrSet("libvirt_volume.test", "allocation"),
 				),
 			},
+			{
+				Config:   testAccVolumeResourceConfigBasic("test-volume", poolPath),
+				PlanOnly: true,
+			},
 			// Delete testing automatically occurs in TestCase
+		},
+	})
+}
+
+func TestAccVolumeResource_explicitSparseAllocation(t *testing.T) {
+	poolPath := t.TempDir()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccVolumeResourceConfigAllocation("test-volume-sparse", poolPath, 0),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_volume.test", "capacity", "1048576"),
+					resource.TestCheckResourceAttr("libvirt_volume.test", "allocation", "0"),
+				),
+			},
+			{
+				Config:   testAccVolumeResourceConfigAllocation("test-volume-sparse", poolPath, 0),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+func TestAccVolumeResource_explicitFullAllocation(t *testing.T) {
+	poolPath := t.TempDir()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccVolumeResourceConfigAllocation("test-volume-full", poolPath, 1024*1024),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_volume.test", "capacity", "1048576"),
+					resource.TestCheckResourceAttr("libvirt_volume.test", "allocation", "1048576"),
+				),
+			},
+			{
+				Config:   testAccVolumeResourceConfigAllocation("test-volume-full", poolPath, 1024*1024),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+func TestAccVolumeResource_importByKey(t *testing.T) {
+	poolPath := t.TempDir()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccVolumeResourceConfigBasic("test-volume-import", poolPath),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("libvirt_volume.test", "key"),
+				),
+			},
+			{
+				ResourceName: "libvirt_volume.test",
+				ImportState:  true,
+				ImportStateIdFunc: func(state *terraform.State) (string, error) {
+					volume, ok := state.RootModule().Resources["libvirt_volume.test"]
+					if !ok {
+						return "", fmt.Errorf("libvirt_volume.test not found in state")
+					}
+
+					key := volume.Primary.Attributes["key"]
+					if key == "" {
+						return "", fmt.Errorf("libvirt_volume.test key not found in state")
+					}
+
+					return key, nil
+				},
+				ImportStateVerify: true,
+				ImportStateVerifyIgnore: []string{
+					"allocation_unit",
+					"capacity_unit",
+					"physical_unit",
+					"target.permissions",
+					"target.timestamps",
+					"type",
+				},
+			},
 		},
 	})
 }
@@ -378,6 +475,206 @@ func TestAccVolumeResource_uploadFromFile(t *testing.T) {
 	})
 }
 
+func TestAccVolumeResource_createContentChangeRequiresReplace(t *testing.T) {
+	poolPath := t.TempDir()
+
+	sourceDir := t.TempDir()
+	sourceFilePath1 := sourceDir + "/source1.img"
+	sourceFilePath2 := sourceDir + "/source2.img"
+
+	if err := os.WriteFile(sourceFilePath1, bytes.Repeat([]byte("a"), 1024*1024), 0644); err != nil {
+		t.Fatalf("Failed to create source1 file: %v", err)
+	}
+	if err := os.WriteFile(sourceFilePath2, bytes.Repeat([]byte("b"), 1024*1024), 0644); err != nil {
+		t.Fatalf("Failed to create source2 file: %v", err)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccVolumeResourceConfigUploadFromFile("test-volume-replace", poolPath, sourceFilePath1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_volume.test", "name", "test-volume-replace.img"),
+					resource.TestCheckResourceAttrSet("libvirt_volume.test", "id"),
+				),
+			},
+			{
+				Config: testAccVolumeResourceConfigUploadFromFile("test-volume-replace", poolPath, sourceFilePath2),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_volume.test", "name", "test-volume-replace.img"),
+					resource.TestCheckResourceAttrSet("libvirt_volume.test", "id"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccVolumeResource_uploadFromHTTPWithContentLength(t *testing.T) {
+	poolPath := t.TempDir()
+	testContent := bytes.Repeat([]byte("a"), 1024*1024)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/image.raw" {
+			http.NotFound(w, r)
+			return
+		}
+
+		http.ServeContent(w, r, "image.raw", time.Time{}, bytes.NewReader(testContent))
+	}))
+	defer server.Close()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccVolumeResourceConfigUploadFromURL("test-volume-upload-http", poolPath, server.URL+"/image.raw", nil),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_volume.test", "name", "test-volume-upload-http.img"),
+					resource.TestCheckResourceAttr("libvirt_volume.test", "pool", "test-pool-upload-url"),
+					resource.TestCheckResourceAttr("libvirt_volume.test", "target.format.type", "raw"),
+					resource.TestCheckResourceAttr("libvirt_volume.test", "capacity", "1048576"),
+					resource.TestCheckResourceAttrSet("libvirt_volume.test", "id"),
+					resource.TestCheckResourceAttrSet("libvirt_volume.test", "key"),
+					resource.TestCheckResourceAttrSet("libvirt_volume.test", "target.path"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccVolumeResource_uploadIntoLargerCapacity(t *testing.T) {
+	poolPath := t.TempDir()
+	testContent := bytes.Repeat([]byte("d"), 1024*1024)
+	requestedCapacity := int64(2 * 1024 * 1024)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/image.raw" {
+			http.NotFound(w, r)
+			return
+		}
+
+		http.ServeContent(w, r, "image.raw", time.Time{}, bytes.NewReader(testContent))
+	}))
+	defer server.Close()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccVolumeResourceConfigUploadFromURL(
+					"test-volume-upload-larger",
+					poolPath,
+					server.URL+"/image.raw",
+					&requestedCapacity,
+				),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_volume.test", "capacity", "2097152"),
+					testAccCheckVolumeFileSize("libvirt_volume.test", requestedCapacity),
+				),
+			},
+		},
+	})
+}
+
+func TestAccVolumeResource_uploadFromHTTPWithoutContentLengthUsesCapacity(t *testing.T) {
+	poolPath := t.TempDir()
+	testContent := bytes.Repeat([]byte("b"), 1024*1024)
+	expectedCapacity := int64(len(testContent))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/image.raw" {
+			http.NotFound(w, r)
+			return
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("response writer does not support flushing")
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+
+		for offset := 0; offset < len(testContent); offset += 4096 {
+			end := offset + 4096
+			if end > len(testContent) {
+				end = len(testContent)
+			}
+			if _, err := w.Write(testContent[offset:end]); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccVolumeResourceConfigUploadFromURL("test-volume-upload-http-no-length", poolPath, server.URL+"/image.raw", &expectedCapacity),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("libvirt_volume.test", "name", "test-volume-upload-http-no-length.img"),
+					resource.TestCheckResourceAttr("libvirt_volume.test", "pool", "test-pool-upload-url"),
+					resource.TestCheckResourceAttr("libvirt_volume.test", "target.format.type", "raw"),
+					resource.TestCheckResourceAttr("libvirt_volume.test", "capacity", "1048576"),
+					resource.TestCheckResourceAttrSet("libvirt_volume.test", "id"),
+					resource.TestCheckResourceAttrSet("libvirt_volume.test", "key"),
+					resource.TestCheckResourceAttrSet("libvirt_volume.test", "target.path"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccVolumeResource_uploadFromHTTPWithoutContentLengthRequiresCapacity(t *testing.T) {
+	poolPath := t.TempDir()
+	testContent := bytes.Repeat([]byte("c"), 1024*1024)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/image.raw" {
+			http.NotFound(w, r)
+			return
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("response writer does not support flushing")
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+
+		for offset := 0; offset < len(testContent); offset += 4096 {
+			end := offset + 4096
+			if end > len(testContent) {
+				end = len(testContent)
+			}
+			if _, err := w.Write(testContent[offset:end]); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccVolumeResourceConfigUploadFromURL("test-volume-upload-http-no-length-error", poolPath, server.URL+"/image.raw", nil),
+				ExpectError: regexp.MustCompile(`(?s)Missing Capacity.*upload source does not provide\s+Content-Length`),
+			},
+		},
+	})
+}
+
 func testAccVolumeResourceConfigUploadFromFile(name, poolPath, sourceFile string) string {
 	return fmt.Sprintf(`
 resource "libvirt_pool" "test" {
@@ -404,4 +701,84 @@ resource "libvirt_volume" "test" {
   }
 }
 `, name, poolPath, sourceFile)
+}
+
+func testAccVolumeResourceConfigAllocation(name, poolPath string, allocation int64) string {
+	return fmt.Sprintf(`
+resource "libvirt_pool" "test" {
+  name = "test-pool-allocation-%[1]s"
+  type = "dir"
+  target = {
+    path = %[2]q
+  }
+}
+
+resource "libvirt_volume" "test" {
+  name       = "%[1]s.raw"
+  pool       = libvirt_pool.test.name
+  capacity   = 1048576
+  allocation = %[3]d
+  target = {
+    format = {
+      type = "raw"
+    }
+  }
+}
+`, name, poolPath, allocation)
+}
+
+func testAccCheckVolumeFileSize(resourceName string, expected int64) resource.TestCheckFunc {
+	return func(state *terraform.State) error {
+		volume, ok := state.RootModule().Resources[resourceName]
+		if !ok {
+			return fmt.Errorf("%s not found in state", resourceName)
+		}
+
+		path := volume.Primary.Attributes["path"]
+		if path == "" {
+			return fmt.Errorf("%s path not found in state", resourceName)
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("stat volume %s: %w", path, err)
+		}
+		if info.Size() != expected {
+			return fmt.Errorf("expected volume file size %d, got %d", expected, info.Size())
+		}
+		return nil
+	}
+}
+
+func testAccVolumeResourceConfigUploadFromURL(name, poolPath, sourceURL string, capacity *int64) string {
+	capacityConfig := ""
+	if capacity != nil {
+		capacityConfig = fmt.Sprintf("  capacity = %d\n", *capacity)
+	}
+
+	return fmt.Sprintf(`
+resource "libvirt_pool" "test" {
+  name = "test-pool-upload-url"
+  type = "dir"
+  target = {
+    path = %[2]q
+  }
+}
+
+resource "libvirt_volume" "test" {
+  name = "%[1]s.img"
+  pool = libvirt_pool.test.name
+%[4]s  target = {
+    format = {
+      type = "raw"
+    }
+  }
+
+  create = {
+    content = {
+      url = %[3]q
+    }
+  }
+}
+`, name, poolPath, sourceURL, capacityConfig)
 }

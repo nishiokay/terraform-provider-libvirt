@@ -16,6 +16,7 @@ The generator follows the global XML <-> HCL mapping rules in `docs/schema-mappi
 
 - Inputs: libvirtxml reflection, docs registry (`internal/codegen/docs/*.yaml` from docindex/docgen), small config hooks
 - IR builder: normalizes struct metadata, tracks optionality, and carries doc strings
+- Field policy layer: applies Terraform-specific semantics after reflection (for example top-level identities, immutability, and exact path overrides)
 - Generators: templates render models/schemas/converters into `internal/generated/*.gen.go`
 - Orchestration: `main.go` wires the pieces and runs gofmt
 
@@ -52,6 +53,79 @@ The generator follows the global XML <-> HCL mapping rules in `docs/schema-mappi
 - Generated Go files land in `internal/generated/` (xxx_convert.gen.go, xxx_schema.gen.go, xxx_model.gen.go)
 
 - Resources embed the generated models/schemas and call the conversions; add/override resource-specific fields (IDs, create helpers) manually
+
+## Field Policy Design
+
+The generator has two separate responsibilities:
+
+1. Structural analysis: reflect libvirtxml structs into IR using facts from Go types and, over time, RNG metadata. This layer should answer questions like "is this a pointer?", "is this an XML attribute?", and "is this nested or repeated?".
+2. Terraform policy: decide how those reflected fields behave in Terraform schemas and conversions. This layer owns decisions like `Computed`, `Required`, `RequiresReplace`, and "preserve user intent" behavior.
+
+Keep those layers separate. The parser should not accumulate ad hoc Terraform exceptions based on struct names. If a field needs special Terraform behavior, prefer a policy rule after reflection rather than embedding one-off conditionals into the reflector.
+
+### Preserve User Intent For Optional Nested Objects
+
+`Preserve user intent` is a generator-level contract, not a resource-by-resource preference.
+
+For optional nested objects, XML omission and user omission are not the same thing:
+
+- If the user did not configure an optional nested object, state should keep it `null`.
+- If the user configured an optional nested object and libvirt omits that object when reading XML back, the conversion should preserve the planned object unless we have an explicit policy that omission means the field was cleared.
+- Do not silently collapse an explicitly configured nested object to `null` only because the readback XML does not echo it.
+
+This rule exists to prevent Terraform `Provider produced inconsistent result after apply` errors for fields such as `alias`, where libvirt may not round-trip the object exactly even though the user configured it explicitly.
+
+In practice, this means the XML -> model conversion for optional nested objects must distinguish:
+
+- `plan field is null`: user does not care, keep state `null`
+- `plan field is non-null` and `xml field is present`: convert XML back into state
+- `plan field is non-null` and `xml field is absent`: preserve the planned value unless an explicit override says otherwise
+
+When changing converter templates, treat this as an invariant that applies uniformly across generated nested object fields. Do not patch individual resources to compensate for generator behavior unless the field truly needs special semantics.
+
+### Policy rules
+
+Policy should be applied in an ordered pass over `StructIR` / `FieldIR`:
+
+- Generic scope-aware rules first
+- Exact path overrides second
+- Resource-specific fallbacks last
+
+Examples:
+
+- Top-level resource identity fields such as `id`, `uuid`, and `key` are provider-managed and should usually be `Computed`
+- Top-level `name` and some top-level `type` fields are immutable inputs and should usually be `Required` plus `RequiresReplace`
+- Nested `id` fields are not automatically provider-managed; many are part of libvirt configuration and should keep their reflected semantics unless an explicit override says otherwise
+- Reported-only fields such as storage pool `capacity` / `allocation` / `available` should be handled by explicit policy rules, not inferred from field names alone
+
+### Override strategy
+
+When the default rules are not enough, use explicit overrides keyed by exact field identity rather than helper functions like `isUserManagedFooStruct`.
+
+Prefer declaring overrides in the policy layer as a registry of named policy functions, for example:
+
+- `StoragePool.capacity` → `policyComputedReportedField`, `policyUseStateForUnknown`
+- `DomainCPU.mode` → `policyPreservePlannedValueOnReadbackOmit`
+- `DomainInterfaceTarget.dev` → `policyPreservePlannedValueOnReadbackOmit` for host-generated interface names that libvirt may canonicalize on readback
+
+This keeps policy declarative and reviewable. Avoid encoding overrides as ad hoc conditionals in converter templates.
+
+Good override targets:
+
+- `storage_pool.capacity`
+- `storage_pool.allocation`
+- `storage_volume.physical`
+- `DomainCPU.mode`
+- `DomainGraphicSpice.listen`
+
+Avoid:
+
+- Struct-name allowlists for one field
+- Field-name heuristics that ignore nesting scope
+- Mixing reflection logic with provider semantics in the same function
+- Adding new `if struct == ... && field == ...` branches in generator templates when a policy override can express the behavior
+
+This keeps the generator predictable, makes exceptions easy to audit, and prevents the parser from turning into a collection of special cases.
 
 ## Documentation tools
 

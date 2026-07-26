@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -10,6 +11,7 @@ import (
 	"github.com/dmacvicar/terraform-provider-libvirt/v2/internal/libvirt"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -19,8 +21,9 @@ import (
 
 // Ensure the implementation satisfies the expected interfaces
 var (
-	_ resource.Resource              = &DomainResource{}
-	_ resource.ResourceWithConfigure = &DomainResource{}
+	_ resource.Resource                = &DomainResource{}
+	_ resource.ResourceWithConfigure   = &DomainResource{}
+	_ resource.ResourceWithImportState = &DomainResource{}
 )
 
 // NewDomainResource creates a new domain resource
@@ -40,6 +43,7 @@ type DomainResourceModel struct {
 	Running   types.Bool   `tfsdk:"running"`
 	Autostart types.Bool   `tfsdk:"autostart"`
 	Create    types.Object `tfsdk:"create"`
+	Update    types.Object `tfsdk:"update"`
 	Destroy   types.Object `tfsdk:"destroy"`
 }
 
@@ -67,9 +71,27 @@ type DomainCreateModel struct {
 	ResetNVRAM  types.Bool `tfsdk:"reset_nvram"`
 }
 
+// DomainUpdateModel describes domain update stop behavior.
+type DomainUpdateModel struct {
+	Shutdown types.Object `tfsdk:"shutdown"`
+}
+
 // DomainDestroyModel describes domain shutdown behavior
 type DomainDestroyModel struct {
-	Graceful types.Bool `tfsdk:"graceful"`
+	Graceful types.Bool   `tfsdk:"graceful"`
+	Shutdown types.Object `tfsdk:"shutdown"`
+}
+
+// DomainShutdownModel describes optional shutdown wait behavior.
+type DomainShutdownModel struct {
+	Timeout types.Int64 `tfsdk:"timeout"`
+}
+
+type domainStopOptions struct {
+	Flags           golibvirt.DomainDestroyFlagsValues
+	ShutdownEnabled bool
+	ShutdownTimeout time.Duration
+	ForceOnTimeout  bool
 }
 
 type domainPlanData struct {
@@ -446,6 +468,85 @@ func domainDestroyFlagsFromDestroy(ctx context.Context, destroyVal types.Object)
 	return flags, nil
 }
 
+func domainShutdownTimeoutFromObject(ctx context.Context, shutdownVal types.Object, defaultTimeout time.Duration) (time.Duration, diag.Diagnostics) {
+	if shutdownVal.IsNull() || shutdownVal.IsUnknown() {
+		return defaultTimeout, nil
+	}
+
+	var shutdownModel DomainShutdownModel
+	diags := shutdownVal.As(ctx, &shutdownModel, basetypes.ObjectAsOptions{})
+	if diags.HasError() {
+		return defaultTimeout, diags
+	}
+
+	if !shutdownModel.Timeout.IsNull() && !shutdownModel.Timeout.IsUnknown() {
+		timeout := shutdownModel.Timeout.ValueInt64()
+		if timeout > 0 {
+			return time.Duration(timeout) * time.Second, nil
+		}
+	}
+
+	return defaultTimeout, nil
+}
+
+func domainUpdateOptionsFromUpdate(ctx context.Context, updateVal types.Object) (domainStopOptions, diag.Diagnostics) {
+	options := domainStopOptions{
+		ShutdownEnabled: true,
+		ShutdownTimeout: 30 * time.Second,
+		ForceOnTimeout:  true,
+	}
+
+	if updateVal.IsNull() || updateVal.IsUnknown() {
+		return options, nil
+	}
+
+	var updateModel DomainUpdateModel
+	diags := updateVal.As(ctx, &updateModel, basetypes.ObjectAsOptions{})
+	if diags.HasError() {
+		return options, diags
+	}
+
+	if !updateModel.Shutdown.IsNull() && !updateModel.Shutdown.IsUnknown() {
+		timeout, timeoutDiags := domainShutdownTimeoutFromObject(ctx, updateModel.Shutdown, options.ShutdownTimeout)
+		diags.Append(timeoutDiags...)
+		if diags.HasError() {
+			return options, diags
+		}
+		options.ShutdownTimeout = timeout
+	}
+
+	return options, diags
+}
+
+func domainDestroyOptionsFromDestroy(ctx context.Context, destroyVal types.Object) (domainStopOptions, diag.Diagnostics) {
+	flags, diags := domainDestroyFlagsFromDestroy(ctx, destroyVal)
+	options := domainStopOptions{
+		Flags: flags,
+	}
+	if diags.HasError() || destroyVal.IsNull() || destroyVal.IsUnknown() {
+		return options, diags
+	}
+
+	var destroyModel DomainDestroyModel
+	diags = destroyVal.As(ctx, &destroyModel, basetypes.ObjectAsOptions{})
+	if diags.HasError() {
+		return options, diags
+	}
+
+	if !destroyModel.Shutdown.IsNull() && !destroyModel.Shutdown.IsUnknown() {
+		options.ShutdownEnabled = true
+		options.ShutdownTimeout = 30 * time.Second
+		timeout, timeoutDiags := domainShutdownTimeoutFromObject(ctx, destroyModel.Shutdown, options.ShutdownTimeout)
+		diags.Append(timeoutDiags...)
+		if diags.HasError() {
+			return options, diags
+		}
+		options.ShutdownTimeout = timeout
+	}
+
+	return options, nil
+}
+
 // Metadata returns the resource type name
 func (r *DomainResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
 	resp.TypeName = req.ProviderTypeName + "_domain"
@@ -475,11 +576,40 @@ func (r *DomainResource) Schema(ctx context.Context, req resource.SchemaRequest,
 				"reset_nvram":  schema.BoolAttribute{Optional: true},
 			},
 		},
+		"update": schema.SingleNestedAttribute{
+			Description: "Update behavior when Terraform must stop the domain before redefining it.",
+			Optional:    true,
+			Attributes: map[string]schema.Attribute{
+				"shutdown": schema.SingleNestedAttribute{
+					Description: "Experimental: request a guest shutdown and wait for shutoff before forcing a stop during update. Subject to change in future releases.",
+					Optional:    true,
+					Attributes: map[string]schema.Attribute{
+						"timeout": schema.Int64Attribute{
+							Description: "Experimental: seconds to wait for guest shutdown before forcing a stop during update. Defaults to 30.",
+							Optional:    true,
+						},
+					},
+				},
+			},
+		},
 		"destroy": schema.SingleNestedAttribute{
 			Description: "Destroy behavior when Terraform removes the domain.",
 			Optional:    true,
 			Attributes: map[string]schema.Attribute{
-				"graceful": schema.BoolAttribute{Optional: true},
+				"graceful": schema.BoolAttribute{
+					Description: "Experimental: request graceful behavior when using DomainDestroyFlags during domain stop. Subject to change in future releases.",
+					Optional:    true,
+				},
+				"shutdown": schema.SingleNestedAttribute{
+					Description: "Experimental: request a guest shutdown and wait for shutoff before undefine. Subject to change in future releases.",
+					Optional:    true,
+					Attributes: map[string]schema.Attribute{
+						"timeout": schema.Int64Attribute{
+							Description: "Experimental: seconds to wait for guest shutdown before failing destroy. Defaults to 30.",
+							Optional:    true,
+						},
+					},
+				},
 			},
 		},
 	}
@@ -511,6 +641,41 @@ func (r *DomainResource) Configure(ctx context.Context, req resource.ConfigureRe
 	}
 
 	r.client = client
+}
+
+func (r *DomainResource) stopDomainIfRunning(domain golibvirt.Domain, options domainStopOptions) (bool, error) {
+	domainState, _, err := r.client.Libvirt().DomainGetState(domain, 0)
+	if err != nil {
+		return false, fmt.Errorf("check domain state: %w", err)
+	}
+
+	if uint32(domainState) != uint32(golibvirt.DomainRunning) {
+		return false, nil
+	}
+
+	if options.ShutdownEnabled {
+		if err := r.client.Libvirt().DomainShutdown(domain); err != nil {
+			return false, fmt.Errorf("request guest shutdown: %w", err)
+		}
+
+		if err := waitForDomainState(r.client, domain, uint32(golibvirt.DomainShutoff), options.ShutdownTimeout); err != nil {
+			if !options.ForceOnTimeout {
+				return true, fmt.Errorf("wait for shutdown: %w", err)
+			}
+
+			if destroyErr := r.client.Libvirt().DomainDestroyFlags(domain, options.Flags); destroyErr != nil {
+				return false, fmt.Errorf("force stop after shutdown timeout: %w", destroyErr)
+			}
+		}
+
+		return false, nil
+	}
+
+	if err := r.client.Libvirt().DomainDestroyFlags(domain, options.Flags); err != nil {
+		return false, fmt.Errorf("force stop running domain: %w", err)
+	}
+
+	return false, nil
 }
 
 // Create creates a new domain
@@ -648,6 +813,7 @@ func (r *DomainResource) Create(ctx context.Context, req resource.CreateRequest,
 		Running:     plan.Running,
 		Autostart:   plan.Autostart,
 		Create:      plan.Create,
+		Update:      plan.Update,
 		Destroy:     plan.Destroy,
 	}
 
@@ -697,10 +863,21 @@ func (r *DomainResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
-	planData, diags := prepareDomainPlan(ctx, &state)
-	resp.Diagnostics.Append(diags...)
-	if resp.Diagnostics.HasError() {
-		return
+	// Detect import: after ImportState, only UUID is set — Name will be null.
+	// When importing, pass nil as plan so DomainFromXML populates all fields from XML.
+	isImport := state.Name.IsNull() || state.Name.IsUnknown()
+
+	var plan *generated.DomainModel
+	var waitAttrs []attr.Value
+
+	if !isImport {
+		planData, diags := prepareDomainPlan(ctx, &state)
+		resp.Diagnostics.Append(diags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		plan = &planData.SanitizedModel
+		waitAttrs = planData.WaitAttributes
 	}
 
 	domain, err := r.client.LookupDomainByUUID(state.UUID.ValueString())
@@ -727,7 +904,7 @@ func (r *DomainResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
-	stateModel, err := generated.DomainFromXML(ctx, parsedDomain, &planData.SanitizedModel)
+	stateModel, err := generated.DomainFromXML(ctx, parsedDomain, plan)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Failed to Convert Domain",
@@ -738,10 +915,15 @@ func (r *DomainResource) Read(ctx context.Context, req resource.ReadRequest, res
 
 	state.DomainModel = *stateModel
 
-	state.Devices, diags = applyWaitForIPValues(ctx, state.Devices, planData.WaitAttributes)
-	resp.Diagnostics.Append(diags...)
-	if resp.Diagnostics.HasError() {
-		return
+	// Always apply wait_for_ip type conversion — the schema expects it.
+	// During import, waitAttrs is nil so all interfaces get null wait_for_ip.
+	{
+		var diags diag.Diagnostics
+		state.Devices, diags = applyWaitForIPValues(ctx, state.Devices, waitAttrs)
+		resp.Diagnostics.Append(diags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
 	}
 
 	if !originalMetadata.IsNull() && !originalMetadata.IsUnknown() {
@@ -752,7 +934,8 @@ func (r *DomainResource) Read(ctx context.Context, req resource.ReadRequest, res
 		state.ID = originalID
 	}
 
-	if !state.Autostart.IsNull() && !state.Autostart.IsUnknown() {
+	// Read autostart — always during import, conditionally otherwise
+	if isImport || (!state.Autostart.IsNull() && !state.Autostart.IsUnknown()) {
 		autostart, err := r.client.Libvirt().DomainGetAutostart(domain)
 		if err != nil {
 			resp.Diagnostics.AddError(
@@ -764,7 +947,30 @@ func (r *DomainResource) Read(ctx context.Context, req resource.ReadRequest, res
 		state.Autostart = types.BoolValue(autostart == 1)
 	}
 
+	// Read running state during import and when the user configured it, so
+	// Terraform can detect out-of-band shutdowns and re-apply running=true.
+	if isImport || (!state.Running.IsNull() && !state.Running.IsUnknown()) {
+		domainState, _, err := r.client.Libvirt().DomainGetState(domain, 0)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Failed to Get Domain State",
+				"Failed to read domain running state: "+err.Error(),
+			)
+			return
+		}
+		state.Running = types.BoolValue(uint32(domainState) == uint32(golibvirt.DomainRunning))
+	}
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// ImportState imports an existing libvirt domain by UUID.
+//
+// Usage:
+//
+//	terraform import libvirt_domain.myvm <uuid>
+func (r *DomainResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughID(ctx, path.Root("uuid"), req, resp)
 }
 
 // waitForDomainState waits for a domain to reach the specified state with a timeout
@@ -781,6 +987,48 @@ func waitForDomainState(client *libvirt.Client, domain golibvirt.Domain, targetS
 		time.Sleep(1 * time.Second)
 	}
 	return fmt.Errorf("timeout waiting for domain to reach state %d", targetState)
+}
+
+func (r *DomainResource) reconcileDomainRunning(ctx context.Context, domain golibvirt.Domain, plan *DomainResourceModel, waitConfigs []interfaceWaitForIPConfig, stopOptions domainStopOptions) error {
+	if plan.Running.IsNull() || plan.Running.IsUnknown() {
+		return nil
+	}
+
+	if plan.Running.ValueBool() {
+		flags, diags := domainStartFlagsFromCreate(ctx, plan.Create)
+		if diags.HasError() {
+			return fmt.Errorf("parse domain start flags: %s", diags.Errors()[0].Detail())
+		}
+
+		state, _, err := r.client.Libvirt().DomainGetState(domain, 0)
+		if err != nil {
+			return fmt.Errorf("check domain state: %w", err)
+		}
+
+		if uint32(state) != uint32(golibvirt.DomainRunning) {
+			if _, err := r.client.Libvirt().DomainCreateWithFlags(domain, flags); err != nil {
+				return fmt.Errorf("start domain: %w", err)
+			}
+		}
+
+		if err := waitForDomainState(r.client, domain, uint32(golibvirt.DomainRunning), 30*time.Second); err != nil {
+			return err
+		}
+
+		for _, waitCfg := range waitConfigs {
+			if err := waitForInterfaceIP(ctx, r.client, domain, waitCfg.MAC, waitCfg.Timeout, waitCfg.Source); err != nil {
+				return fmt.Errorf("wait for IP address (MAC: %s): %w", waitCfg.MAC, err)
+			}
+		}
+
+		return nil
+	}
+
+	if _, err := r.stopDomainIfRunning(domain, stopOptions); err != nil {
+		return err
+	}
+
+	return waitForDomainState(r.client, domain, uint32(golibvirt.DomainShutoff), 30*time.Second)
 }
 
 // Update updates the domain
@@ -821,33 +1069,47 @@ func (r *DomainResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 
-	domainState, _, err := r.client.Libvirt().DomainGetState(existingDomain, 0)
-	if err != nil {
-		resp.Diagnostics.AddError(
-			"Failed to Get Domain State",
-			"Failed to check if domain is running: "+err.Error(),
-		)
+	updateOptions, updateDiags := domainUpdateOptionsFromUpdate(ctx, plan.Update)
+	resp.Diagnostics.Append(updateDiags...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	if uint32(domainState) == uint32(golibvirt.DomainRunning) {
-		if err := r.client.Libvirt().DomainShutdown(existingDomain); err != nil {
+	statePlanData, diags := prepareDomainPlan(ctx, &state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !state.UUID.IsNull() && !state.UUID.IsUnknown() {
+		statePlanData.SanitizedModel.UUID = state.UUID
+	}
+
+	domainConfigUnchanged := reflect.DeepEqual(planData.SanitizedModel, statePlanData.SanitizedModel)
+	runningChanged := !plan.Running.Equal(state.Running)
+	autostartUnchanged := plan.Autostart.Equal(state.Autostart)
+	if domainConfigUnchanged && runningChanged && autostartUnchanged {
+		if err := r.reconcileDomainRunning(ctx, existingDomain, &plan, planData.WaitConfigs, updateOptions); err != nil {
 			resp.Diagnostics.AddError(
-				"Failed to Shutdown Domain",
-				"Domain must be stopped before updating. Failed to shutdown: "+err.Error(),
+				"Failed to Update Domain Running State",
+				"Domain configuration was unchanged, but failed to reconcile running state: "+err.Error(),
 			)
 			return
 		}
 
-		if err := waitForDomainState(r.client, existingDomain, uint32(golibvirt.DomainShutoff), 5*time.Second); err != nil {
-			if err := r.client.Libvirt().DomainDestroy(existingDomain); err != nil {
-				resp.Diagnostics.AddError(
-					"Failed to Stop Domain",
-					"Domain must be stopped before updating. Failed to force stop: "+err.Error(),
-				)
-				return
-			}
-		}
+		state.Running = plan.Running
+		state.Create = plan.Create
+		state.Update = plan.Update
+		state.Destroy = plan.Destroy
+		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+		return
+	}
+
+	if _, err := r.stopDomainIfRunning(existingDomain, updateOptions); err != nil {
+		resp.Diagnostics.AddError(
+			"Failed to Stop Domain",
+			"Domain must be stopped before updating: "+err.Error(),
+		)
+		return
 	}
 
 	domainXML, err := generated.DomainToXML(ctx, &planData.SanitizedModel)
@@ -975,6 +1237,7 @@ func (r *DomainResource) Update(ctx context.Context, req resource.UpdateRequest,
 		Running:     plan.Running,
 		Autostart:   plan.Autostart,
 		Create:      plan.Create,
+		Update:      plan.Update,
 		Destroy:     plan.Destroy,
 	}
 
@@ -988,8 +1251,8 @@ func (r *DomainResource) Update(ctx context.Context, req resource.UpdateRequest,
 		newState.Metadata = plan.Metadata
 	}
 
-	if newState.ID.IsNull() && !state.ID.IsNull() && !state.ID.IsUnknown() {
-		newState.ID = state.ID
+	if !plan.ID.IsNull() && !plan.ID.IsUnknown() {
+		newState.ID = plan.ID
 	}
 
 	if !newState.Autostart.IsNull() && !newState.Autostart.IsUnknown() {
@@ -1015,7 +1278,7 @@ func (r *DomainResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		return
 	}
 
-	destroyFlags, destroyDiags := domainDestroyFlagsFromDestroy(ctx, state.Destroy)
+	destroyOptions, destroyDiags := domainDestroyOptionsFromDestroy(ctx, state.Destroy)
 	resp.Diagnostics.Append(destroyDiags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -1028,26 +1291,21 @@ func (r *DomainResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		return
 	}
 
-	// Destroy (stop) the domain if it's running
-	domainState, _, err := r.client.Libvirt().DomainGetState(domain, 0)
+	timedOut, err := r.stopDomainIfRunning(domain, destroyOptions)
 	if err != nil {
-		resp.Diagnostics.AddError(
-			"Failed to Get Domain State",
-			"Failed to check domain state: "+err.Error(),
-		)
-		return
-	}
-
-	// DomainState values: 0=nostate, 1=running, 2=blocked, 3=paused, 4=shutdown, 5=shutoff, 6=crashed, 7=pmsuspended
-	if uint32(domainState) == uint32(golibvirt.DomainRunning) {
-		err = r.client.Libvirt().DomainDestroyFlags(domain, destroyFlags)
-		if err != nil {
+		if timedOut {
 			resp.Diagnostics.AddError(
-				"Failed to Destroy Domain",
-				"Failed to stop running domain: "+err.Error(),
+				"Timeout Waiting for Domain Shutdown",
+				fmt.Sprintf("Domain did not reach shutoff state within %s: %s", destroyOptions.ShutdownTimeout, err),
 			)
 			return
 		}
+
+		resp.Diagnostics.AddError(
+			"Failed to Destroy Domain",
+			"Failed to stop running domain: "+err.Error(),
+		)
+		return
 	}
 
 	libvirtVersion, err := r.client.Libvirt().ConnectGetLibVersion()
